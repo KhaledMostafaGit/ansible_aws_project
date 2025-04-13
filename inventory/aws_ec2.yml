@@ -1,0 +1,10 @@
+---
+plugin: amazon.aws.aws_ec2
+regions:
+  - eu-north-1                # List your region(s) here.
+filters:
+  instance-state-name: running
+hostnames:
+  - public-ip-address         # Use this if you want to SSH to the instance using its public IP.
+keyed_groups:
+  - key: tags.Name            # This groups hosts by the Name tag (adjust as needed)
