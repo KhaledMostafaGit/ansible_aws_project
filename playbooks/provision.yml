@@ -36,7 +36,7 @@
         state: present
         vpc_id: "{{ my_vpc.vpc.id }}"
         cidr: "{{ subnet_cidr_block }}"
-        az: "eu-north-1a"
+        availability_zone: "eu-north-1a"
         region: "{{ region }}"
         tags:
           Name: "MySubnet"
@@ -52,7 +52,7 @@
         state: present
         vpc_id: "{{ my_vpc.vpc.id }}"
         cidr: "10.0.2.0/24"  # Different CIDR than your first subnet
-        az: "eu-north-1b"  # Explicitly choose AZ 'b' (different from the default AZ)
+        availability_zone: "eu-north-1b"  # Explicitly choose AZ 'b' (different from the default AZ)
         region: "{{ region }}"
         tags:
           Name: "MySecondSubnet"
