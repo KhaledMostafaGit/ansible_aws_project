@@ -1,0 +1,425 @@
+---
+- name: Clean up AWS resources
+  hosts: localhost
+  gather_facts: yes
+  vars:
+    region: eu-north-1
+    # Default values (will be overridden if resource file is found)
+    vpc_id: "vpc-092943e070bc55e46"
+    subnet_id: "subnet-012d7470bea85ce0c"
+    second_subnet_id: "subnet-043637d931c63a366"
+    subnet_cidr_block: "10.0.1.0/24"
+    igw_id: "igw-0059244e71abf1a7a"
+    route_table_id: "rtb-09b1879fc83f5f1ea"
+    security_group_id: "sg-0b86cdc553bbad12c"
+    ec2_instance_id: "i-0543072b9a4f1dc27"
+    ami_id: "ami-05b226c71e53fbd2f"
+    s3_buckets:
+      - "khaled-app-assets-8ccf31dc"
+      - "khaled-app-backups-ff3649bc"
+    rds_instance_id: "ansible-mysql-instance"
+    rds_subnet_group_name: "ansible-rds-subnet-group"
+    rds_param_group_name: "ansible-mysql-params"
+    rds_security_group_id: "sg-0857c0f0ab697c5fe"
+    iam_instance_profile_name: "EC2SSMInstanceProfile"
+    iam_role_name: "EC2SSMRole"
+    # Resource file path
+    resource_file: "./aws_resources_{{ ansible_date_time.date }}.txt"
+    resource_file_fallback: "./aws_resources_*.txt"
+
+  tasks:
+    # 0. Try to read resource information from file (if available)
+    - name: Check if resource file exists with current date
+      stat:
+        path: "{{ resource_file }}"
+      register: res_file
+      ignore_errors: yes
+      
+    - name: Find latest resource file if current date file doesn't exist
+      find:
+        paths: "./"
+        patterns: "aws_resources_*.txt"
+        file_type: file
+      register: res_files
+      when: not res_file.stat.exists | default(false)
+      ignore_errors: yes
+      
+    - name: Set latest file path
+      set_fact:
+        latest_res_file: "{{ res_files.files | sort(attribute='mtime') | last }}"
+      when: res_files.matched | default(0) > 0
+      ignore_errors: yes
+      
+    - name: Read resource file
+      slurp:
+        src: "{{ res_file.stat.path if res_file.stat.exists | default(false) else latest_res_file.path }}"
+      register: resources_content
+      when: (res_file.stat.exists | default(false)) or (res_files.matched | default(0) > 0)
+      ignore_errors: yes
+      
+    - name: Display resource file information
+      debug:
+        msg: "Using resource information from: {{ res_file.stat.path if res_file.stat.exists | default(false) else latest_res_file.path | default('No file found') }}"
+      when: (res_file.stat.exists | default(false)) or (res_files.matched | default(0) > 0)
+      ignore_errors: yes
+
+    - name: Extract resource IDs from file
+      set_fact:
+        vpc_id: "{{ resources_content['content'] | b64decode | regex_search('VPC:\n- ID: ([a-z0-9-]+)', '\\1') | first }}"
+        subnet_id: "{{ resources_content['content'] | b64decode | regex_search('Subnet:\n- ID: ([a-z0-9-]+)', '\\1') | first }}"
+        second_subnet_id: "{{ resources_content['content'] | b64decode | regex_search('- Subnet 2 ID: ([a-z0-9-]+)', '\\1') | first }}"
+        igw_id: "{{ resources_content['content'] | b64decode | regex_search('Internet Gateway:\n- ID: ([a-z0-9-]+)', '\\1') | first }}"
+        security_group_id: "{{ resources_content['content'] | b64decode | regex_search('Security Groups:\n- Web/SSH: ([a-z0-9-]+)', '\\1') | first }}"
+        rds_security_group_id: "{{ resources_content['content'] | b64decode | regex_search('- RDS: ([a-z0-9-]+)', '\\1') | first }}"
+        ec2_instance_id: "{{ resources_content['content'] | b64decode | regex_search('EC2 Instance:\n- ID: ([a-z0-9-]+)', '\\1') | first }}"
+        ami_id: "{{ resources_content['content'] | b64decode | regex_search('Custom AMI:\n- ID: ([a-z0-9-]+)', '\\1') | first }}"
+        extracted_s3_buckets: "{{ resources_content['content'] | b64decode | regex_findall('- ([a-z0-9-]+)', resources_content['content'] | b64decode | regex_search('S3 Buckets:\n((?:- [a-z0-9-]+\n?)+)')) }}"
+      when: resources_content is defined and resources_content.content is defined
+      ignore_errors: yes
+      
+    - name: Update S3 bucket list if extracted
+      set_fact:
+        s3_buckets: "{{ extracted_s3_buckets }}"
+      when: extracted_s3_buckets is defined and extracted_s3_buckets | length > 0
+      ignore_errors: yes
+      
+    - name: Display warning
+      debug:
+        msg: |
+          WARNING: This will delete all resources created in the provisioning playbook.
+          - EC2 Instance ({{ ec2_instance_id }})
+          - Custom AMI ({{ ami_id }})
+          - VPC and networking components
+          - S3 buckets ({{ s3_buckets | join(', ') }})
+          - RDS instance and related resources
+          - IAM roles and instance profiles
+          
+          Continuing in 5 seconds...
+    
+    - name: Pause for awareness
+      pause:
+        seconds: 5
+    
+    # 1. Clean up RDS resources first
+    - name: Delete RDS instance
+      community.aws.rds_instance:
+        id: "{{ rds_instance_id }}"
+        state: absent
+        skip_final_snapshot: true
+        region: "{{ region }}"
+      register: rds_deleted
+      ignore_errors: yes
+      
+    - name: Wait for RDS instance to be deleted
+      pause:
+        seconds: 60
+      when: rds_deleted is changed
+      
+    - name: Delete RDS subnet group
+      community.aws.rds_subnet_group:
+        name: "{{ rds_subnet_group_name }}"
+        state: absent
+        region: "{{ region }}"
+      ignore_errors: yes
+      
+    - name: Delete RDS parameter group
+      community.aws.rds_param_group:
+        name: "{{ rds_param_group_name }}"
+        state: absent
+        region: "{{ region }}"
+      ignore_errors: yes
+      
+    - name: Delete RDS security group
+      amazon.aws.ec2_group:
+        group_id: "{{ rds_security_group_id | default('sg-dummy') }}"
+        region: "{{ region }}"
+        state: absent
+      ignore_errors: yes
+      when: rds_security_group_id is defined and rds_security_group_id != 'Not created'
+    
+    # 2. Clean up S3 buckets
+    - name: Empty S3 buckets
+      command: >
+        aws s3 rm s3://{{ item }}/ --recursive
+      loop: "{{ s3_buckets }}"
+      ignore_errors: yes
+          
+    - name: Delete S3 buckets
+      amazon.aws.s3_bucket:
+        name: "{{ item }}"
+        state: absent
+        force: yes
+        region: "{{ region }}"
+      loop: "{{ s3_buckets }}"
+      ignore_errors: yes
+    
+    # 3. Clean up EC2 and AMI resources
+    - name: Delete AMI
+      amazon.aws.ec2_ami:
+        image_id: "{{ ami_id }}"
+        region: "{{ region }}"
+        state: absent
+        delete_snapshot: yes
+      ignore_errors: yes
+
+    - name: Terminate EC2 Instance
+      amazon.aws.ec2_instance:
+        instance_ids:
+          - "{{ ec2_instance_id }}"
+        region: "{{ region }}"
+        state: absent
+        wait: yes  # This waits for the termination to complete
+      register: ec2_termination
+      ignore_errors: yes
+
+    - name: Verify EC2 instance termination
+      command: >
+        aws ec2 describe-instances
+        --instance-ids {{ ec2_instance_id }}
+        --query "Reservations[].Instances[].State.Name"
+        --output text
+        --region {{ region }}
+      register: instance_state
+      ignore_errors: yes
+      until: instance_state.stdout == "" or "terminated" in instance_state.stdout
+      retries: 10
+      delay: 15
+      when: ec2_termination is changed
+
+    - name: Wait additional time for termination to propagate
+      pause:
+        seconds: 30
+      when: ec2_termination is changed
+
+    - name: Delete Security Group
+      amazon.aws.ec2_group:
+        group_id: "{{ security_group_id }}"
+        region: "{{ region }}"
+        state: absent
+      ignore_errors: yes
+
+    # 4. Clean up IAM resources
+    - name: Delete IAM instance profile
+      amazon.aws.iam_instance_profile:
+        name: "{{ iam_instance_profile_name }}"
+        state: absent
+      ignore_errors: yes
+      
+    # Instead of updating the role first, just delete it directly
+    - name: Delete IAM role
+      amazon.aws.iam_role:
+        name: "{{ iam_role_name }}"
+        state: absent
+        force: true  # This will force delete even if there are attached policies
+      ignore_errors: yes
+
+    # 5. Clean up VPC resources using AWS CLI for more reliability
+    # Use AWS CLI to disassociate route tables first
+    - name: Get subnet associations with route tables
+      command: >
+        aws ec2 describe-route-tables 
+        --filters "Name=vpc-id,Values={{ vpc_id }}" 
+        --query "RouteTables[].Associations[?!Main][].{Id:RouteTableAssociationId}" 
+        --output text
+        --region {{ region }}
+      register: route_associations
+      ignore_errors: yes
+
+    - name: Disassociate route tables
+      command: >
+        aws ec2 disassociate-route-table 
+        --association-id {{ item }}
+        --region {{ region }}
+      with_items: "{{ route_associations.stdout_lines | default([]) }}"
+      ignore_errors: yes
+      when: route_associations.stdout_lines is defined and route_associations.stdout_lines | length > 0
+
+    # Delete non-main route tables
+    - name: Get non-main route tables
+      command: >
+        aws ec2 describe-route-tables 
+        --filters "Name=vpc-id,Values={{ vpc_id }}" 
+        --query "RouteTables[?Associations[?!Main][].RouteTableAssociationId].RouteTableId" 
+        --output text
+        --region {{ region }}
+      register: non_main_route_tables
+      ignore_errors: yes
+
+    - name: Delete non-main route tables
+      command: >
+        aws ec2 delete-route-table 
+        --route-table-id {{ item }}
+        --region {{ region }}
+      with_items: "{{ non_main_route_tables.stdout_lines | default([]) }}"
+      ignore_errors: yes
+
+    - name: Detach Internet Gateway
+      command: >
+        aws ec2 detach-internet-gateway 
+        --internet-gateway-id {{ igw_id }} 
+        --vpc-id {{ vpc_id }}
+        --region {{ region }}
+      ignore_errors: yes
+
+    - name: Delete Internet Gateway
+      command: >
+        aws ec2 delete-internet-gateway 
+        --internet-gateway-id {{ igw_id }}
+        --region {{ region }}
+      ignore_errors: yes
+
+    - name: Delete subnets using AWS CLI
+      command: >
+        aws ec2 delete-subnet 
+        --subnet-id {{ item }} 
+        --region {{ region }}
+      loop:
+        - "{{ subnet_id }}"
+        - "{{ second_subnet_id | default('subnet-dummy') }}"
+      ignore_errors: yes
+      when: item != 'subnet-dummy'
+
+    - name: Wait for subnet deletion to complete
+      pause:
+        seconds: 10
+
+    # Add these tasks after deleting subnets but before deleting the VPC:
+
+    # Check for remaining network interfaces
+    - name: Find any remaining network interfaces in the VPC
+      command: >
+        aws ec2 describe-network-interfaces
+        --filters "Name=vpc-id,Values={{ vpc_id }}"
+        --query "NetworkInterfaces[*].NetworkInterfaceId"
+        --output text
+        --region {{ region }}
+      register: remaining_enis
+      ignore_errors: yes
+
+    - name: Display any found network interfaces
+      debug:
+        msg: "Found network interfaces still attached to VPC: {{ remaining_enis.stdout_lines }}"
+      when: remaining_enis.stdout_lines | default([]) | length > 0
+
+    # Try to detach them first if they're attached
+    - name: Get attachment IDs for network interfaces
+      command: >
+        aws ec2 describe-network-interfaces
+        --filters "Name=vpc-id,Values={{ vpc_id }}"
+        --query "NetworkInterfaces[?Attachment].{ENI:NetworkInterfaceId,AttachmentId:Attachment.AttachmentId}"
+        --output json
+        --region {{ region }}
+      register: eni_attachments
+      ignore_errors: yes
+
+    - name: Set ENI attachment fact
+      set_fact:
+        eni_attachment_map: "{{ eni_attachments.stdout | from_json }}"
+      ignore_errors: yes
+      when: eni_attachments.stdout is defined
+
+    - name: Detach network interfaces
+      command: >
+        aws ec2 detach-network-interface
+        --attachment-id {{ item.AttachmentId }}
+        --force
+        --region {{ region }}
+      loop: "{{ eni_attachment_map | default([]) }}"
+      when: eni_attachment_map is defined
+      ignore_errors: yes
+
+    - name: Wait for detachment to complete
+      pause:
+        seconds: 10
+      when: eni_attachment_map is defined and eni_attachment_map | length > 0
+
+    # Now delete the network interfaces
+    - name: Delete network interfaces
+      command: >
+        aws ec2 delete-network-interface
+        --network-interface-id {{ item }}
+        --region {{ region }}
+      loop: "{{ remaining_enis.stdout_lines | default([]) }}"
+      ignore_errors: yes
+      when: remaining_enis.stdout_lines | default([]) | length > 0
+
+    - name: Wait for network interface deletion
+      pause:
+        seconds: 10
+      when: remaining_enis.stdout_lines | default([]) | length > 0
+
+    # Check for any other dependencies not caught yet
+    - name: Check for any remaining security groups in VPC
+      command: >
+        aws ec2 describe-security-groups
+        --filters "Name=vpc-id,Values={{ vpc_id }}"
+        --query "SecurityGroups[?GroupName!='default'].GroupId"
+        --output text
+        --region {{ region }}
+      register: remaining_sgs
+      ignore_errors: yes
+
+    - name: Delete any remaining security groups
+      command: >
+        aws ec2 delete-security-group
+        --group-id {{ item }}
+        --region {{ region }}
+      loop: "{{ remaining_sgs.stdout_lines | default([]) }}"
+      ignore_errors: yes
+      when: remaining_sgs.stdout_lines | default([]) | length > 0
+
+    # Final pause before VPC deletion to ensure all dependencies are processed
+    - name: Final pause before VPC deletion
+      pause:
+        seconds: 15
+      when: remaining_enis.stdout_lines | default([]) | length > 0 or remaining_sgs.stdout_lines | default([]) | length > 0
+
+    # Now try to delete the VPC again
+
+    - name: Delete VPC
+      command: >
+        aws ec2 delete-vpc 
+        --vpc-id {{ vpc_id }}
+        --region {{ region }}
+      register: vpc_deletion_result
+      ignore_errors: yes
+
+    - name: Check if VPC was deleted
+      command: >
+        aws ec2 describe-vpcs
+        --vpc-ids {{ vpc_id }}
+        --query "Vpcs[].VpcId"
+        --output text
+        --region {{ region }}
+      register: vpc_check
+      ignore_errors: yes
+
+    - name: Display manual deletion instructions if VPC still exists
+      debug:
+        msg: |
+          WARNING: Unable to automatically delete VPC {{ vpc_id }}.
+          
+          Please manually check for remaining dependencies in the AWS Console:
+          https://{{ region }}.console.aws.amazon.com/vpc/home?region={{ region }}#vpcs:search={{ vpc_id }}
+          
+          Common dependencies that may still be attached:
+          1. Network Interfaces (ENIs)
+          2. Security Groups
+          3. NAT Gateways
+          4. VPC Endpoints
+          5. VPC Peering Connections
+          6. Transit Gateway attachments
+          
+          Please delete these resources manually and then delete the VPC.
+      when: vpc_check.rc == 0 and vpc_check.stdout | length > 0
+      
+    - name: Display cleanup summary
+      debug:
+        msg: |
+          Cleanup complete! The following resources have been deleted:
+          - EC2 Instance and AMI
+          - VPC, Subnet, Internet Gateway, Route Table and Security Groups
+          - RDS instance, subnet group, and parameter group
+          - S3 buckets and their contents
+          - IAM role and instance profile
+

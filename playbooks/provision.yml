@@ -1,0 +1,402 @@
+---
+- name: Create AWS resources and Launch EC2 Instance, then Create an AMI
+  hosts: localhost
+  gather_facts: yes  # Changed from no to yes to enable ansible_date_time
+  vars:
+    region: eu-north-1                        # Stockholm region
+    instance_type: t3.micro
+    ami_id: ami-0c2e61fdcb5495691              # Replace with a valid AMI for eu-north-1 (should have SSM agent pre-installed)
+    key_name: AnsibleKeyPEM                   # Ensure this key exists in your AWS account
+    vpc_cidr_block: "10.0.0.0/16"
+    subnet_cidr_block: "10.0.1.0/24"
+    security_group_cidr_ingress: "0.0.0.0/0"
+    security_group_cidr_egress: "0.0.0.0/0"
+    security_group_ports:
+      - 80
+      - 443
+      - 22  # For SSH access if needed
+    # Variable for the AMI name; we use a timestamp to ensure uniqueness
+    ami_name: "CustomAMI-{{ lookup('pipe','date +%Y%m%d%H%M%S') }}"
+  tasks:
+    - name: Create VPC
+      amazon.aws.ec2_vpc_net:
+        name: "MyVPC"
+        cidr_block: "{{ vpc_cidr_block }}"
+        region: "{{ region }}"
+        tags:
+          Name: "MyVPC"
+      register: my_vpc
+
+    - name: Output VPC ID
+      debug:
+        msg: "VPC ID is {{ my_vpc.vpc.id }}"
+
+    - name: Create Subnet
+      amazon.aws.ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        cidr: "{{ subnet_cidr_block }}"
+        az: "{{ region }}a"
+        region: "{{ region }}"
+        tags:
+          Name: "MySubnet"
+      register: my_subnet
+
+    - name: Output Subnet ID
+      debug:
+        msg: "Subnet ID is {{ my_subnet.subnet.id }}"
+
+    # Create a second subnet in a different AZ for RDS requirements
+    - name: Create second subnet in a different AZ for RDS
+      amazon.aws.ec2_vpc_subnet:
+        state: present
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        cidr: "10.0.2.0/24"  # Different CIDR than your first subnet
+        az: "{{ region }}b"  # Explicitly choose AZ 'b' (different from the default AZ)
+        region: "{{ region }}"
+        tags:
+          Name: "MySecondSubnet"
+      register: second_subnet
+
+    - name: Output Second Subnet ID
+      debug:
+        msg: "Second Subnet ID is {{ second_subnet.subnet.id }}"
+
+    - name: Create Internet Gateway
+      amazon.aws.ec2_vpc_igw:
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        region: "{{ region }}"
+        tags:
+          Name: "MyIGW"
+      register: igw
+
+    - name: Output Internet Gateway ID
+      debug:
+        msg: "Internet Gateway ID is {{ igw.gateway_id }}"
+
+    - name: Create route table
+      amazon.aws.ec2_vpc_route_table:
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        region: "{{ region }}"
+        subnets:
+          - "{{ my_subnet.subnet.id }}"
+          - "{{ second_subnet.subnet.id }}"
+        routes:
+          - dest: 0.0.0.0/0
+            gateway_id: "{{ igw.gateway_id }}"
+        tags:
+          Name: "MyRouteTable"
+      register: route_table
+
+    - name: Output Route Table ID
+      debug:
+        msg: "Route Table ID is {{ route_table.route_table.id }}"
+
+    - name: Create Security Group
+      amazon.aws.ec2_group:
+        name: "MySc"
+        description: "My security group"
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports: "{{ security_group_ports }}"
+            cidr_ip: "{{ security_group_cidr_ingress }}"
+          # Add rule for SSM connectivity (HTTPS outbound to AWS endpoints)
+          - proto: tcp
+            ports: 443
+            cidr_ip: "{{ security_group_cidr_ingress }}"
+        rules_egress:
+          - proto: all
+            cidr_ip: "{{ security_group_cidr_egress }}"
+      register: security_group
+
+    - name: Output Security Group ID
+      debug:
+        msg: "Security Group ID is {{ security_group.group_id }}"
+
+    # Create IAM Role for SSM with S3 access
+    - name: Create IAM role for EC2 SSM with S3 access
+      amazon.aws.iam_role:
+        name: EC2SSMRole
+        assume_role_policy_document: |
+          {
+            "Version": "2012-10-17",
+            "Statement": [
+              {
+                "Effect": "Allow",
+                "Principal": {
+                  "Service": "ec2.amazonaws.com"
+                },
+                "Action": "sts:AssumeRole"
+              }
+            ]
+          }
+        managed_policies:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        state: present
+      register: ssm_role
+
+    # Create Instance Profile
+    - name: Create IAM instance profile for SSM
+      amazon.aws.iam_instance_profile:
+        name: EC2SSMInstanceProfile
+        role: EC2SSMRole
+        state: present
+      register: instance_profile
+
+    - name: Wait for instance profile to be available
+      pause:
+        seconds: 10
+
+    - name: Launch EC2 Instance
+      amazon.aws.ec2_instance:
+        name: "AnsibleProvisionedInstance"
+        instance_type: "{{ instance_type }}"
+        region: "{{ region }}"
+        image_id: "{{ ami_id }}"
+        subnet_id: "{{ my_subnet.subnet.id }}"
+        key_name: "{{ key_name }}"
+        wait: yes
+        security_group: "{{ security_group.group_id }}"
+        network:
+          assign_public_ip: true
+        iam_instance_profile: EC2SSMInstanceProfile
+        user_data: |
+          #!/bin/bash
+          # Ensure latest SSM agent is installed and running
+          cd /tmp
+          sudo yum install -y https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/linux_amd64/amazon-ssm-agent.rpm
+          sudo systemctl enable amazon-ssm-agent
+          sudo systemctl start amazon-ssm-agent
+        tags:
+          Environment: Testing
+          role: webserver
+          Name: AnsibleProvisionedInstance
+      register: ec2
+
+    - name: Output Instance Details
+      debug:
+        msg: "Instance ID is {{ ec2.instances[0].instance_id }}, Public IP is {{ ec2.instances[0].public_ip_address }}"
+
+    - name: Wait for instance initialization
+      pause:
+        minutes: 3
+        prompt: "Waiting for instance to initialize and SSM agent to start..."
+
+    - name: Verify SSM connectivity
+      command: aws ssm describe-instance-information --filters "Key=InstanceIds,Values={{ ec2.instances[0].instance_id }}"
+      environment:
+        AWS_REGION: "{{ region }}"
+      register: ssm_check
+      until: ssm_check.stdout | from_json | json_query('InstanceInformationList[*]') | length > 0
+      retries: 10
+      delay: 30
+      ignore_errors: yes
+
+    # --- AWS Image Building Section ---
+    - pause:
+        minutes: 5
+
+    - name: Creating the AMI from the instance
+      amazon.aws.ec2_ami:
+        instance_id: "{{ ec2.instances[0].instance_id }}"
+        wait: yes
+        name: "{{ ami_name }}"
+        tags:
+          Name: "{{ ami_name }}"
+      register: created_ami
+
+    - name: Output AMI Details
+      debug:
+        msg: "AMI created: {{ created_ami.image_id }}, Name: {{ ami_name }}"
+
+    - name: Verify SSM connectivity
+      command: aws ssm describe-instance-information --filters "Key=InstanceIds,Values={{ ec2.instances[0].instance_id }}"
+      environment:
+        AWS_REGION: "{{ region }}"
+      register: ssm_check
+      until: ssm_check.stdout | from_json | json_query('InstanceInformationList[*]') | length > 0
+      retries: 10
+      delay: 30
+      ignore_errors: yes
+      
+    - name: Display SSM connectivity status
+      debug:
+        msg: "Instance is connected to SSM: {{ 'Yes' if ssm_check.rc == 0 else 'No - check SSM agent status on the instance' }}"
+
+    # --- S3 Bucket Provisioning ---
+    - name: Create S3 buckets
+      amazon.aws.s3_bucket:
+        name: "{{ item.name }}"
+        state: present
+        region: "{{ region }}"
+        tags:
+          Environment: "{{ item.environment | default('Testing') }}"
+          Project: "AnsibleAWS"
+      register: s3_buckets
+      loop:
+        - name: "khaled-app-assets-{{ 999999999 | random | to_uuid | hash('md5') | truncate(8, True, '') }}"
+          environment: Production
+        - name: "khaled-app-backups-{{ 999999999 | random | to_uuid | hash('md5') | truncate(8, True, '') }}"
+          environment: Production
+      ignore_errors: yes
+
+    - name: Store S3 bucket names
+      set_fact:
+        bucket_names: "{{ s3_buckets.results | map(attribute='item.name') | list }}"
+      when: s3_buckets is defined and s3_buckets.results is defined
+
+    - name: Configure S3 bucket versioning
+      amazon.aws.s3_bucket:
+        name: "{{ item }}"
+        state: present
+        versioning: yes
+        region: "{{ region }}"
+      loop: "{{ bucket_names | default([]) }}"
+      ignore_errors: yes
+
+    - name: Output S3 bucket information
+      debug:
+        msg: "Created S3 bucket: {{ item }}"
+      loop: "{{ bucket_names | default([]) }}"
+
+    # --- RDS Database Provisioning ---
+    - name: Create RDS subnet group with multiple AZs
+      community.aws.rds_subnet_group:
+        name: ansible-rds-subnet-group
+        description: "Subnet group for RDS instances (covers multiple AZs)"
+        region: "{{ region }}"
+        state: present
+        subnets:
+          - "{{ my_subnet.subnet.id }}"
+          - "{{ second_subnet.subnet.id }}"
+      register: rds_subnet_group
+
+    - name: Create RDS security group
+      amazon.aws.ec2_group:
+        name: rds-security-group
+        description: "Security group for RDS instances"
+        vpc_id: "{{ my_vpc.vpc.id }}"
+        region: "{{ region }}"
+        rules:
+          - proto: tcp
+            ports: 3306  # MySQL/MariaDB port
+            cidr_ip: "{{ vpc_cidr_block }}"  # Allow access from within our VPC
+        rules_egress:
+          - proto: all
+            cidr_ip: "0.0.0.0/0"
+      register: rds_security_group
+
+    - name: Create RDS parameter group
+      community.aws.rds_param_group:
+        name: ansible-mysql-params
+        description: "MySQL parameter group created with Ansible"
+        engine: mysql8.0
+        region: "{{ region }}"
+        state: present
+        parameters:
+          character_set_server: utf8mb4
+          character_set_client: utf8mb4
+          max_connections: "100"
+      register: db_parameter_group
+      ignore_errors: yes
+
+    - name: Create RDS MySQL instance
+      community.aws.rds_instance:
+        id: ansible-mysql-instance
+        state: present
+        engine: mysql
+        engine_version: 8.0
+        db_instance_class: db.t3.micro
+        allocated_storage: 20
+        storage_type: gp2
+        storage_encrypted: false
+        master_username: dbadmin
+        master_user_password: "{{ lookup('password', '/dev/null length=16 chars=ascii_letters,digits') }}"
+        multi_az: false  # Single AZ deployment to reduce costs
+        vpc_security_group_ids: 
+          - "{{ rds_security_group.group_id }}"
+        db_subnet_group_name: ansible-rds-subnet-group
+        region: "{{ region }}"
+        skip_final_snapshot: true  # Important - avoids leaving snapshots that incur costs
+        deletion_protection: false  # Makes it easier to delete later
+        backup_retention_period: 1  # Minimum backup retention to reduce costs
+        tags:
+          Environment: Testing
+          Name: AnsibleRDS
+      register: rds_instance
+      ignore_errors: yes
+
+    - name: Output RDS instance information
+      debug:
+        msg: |
+          RDS Instance Details:
+          - Endpoint: {{ rds_instance.endpoint.address | default('Not available') }}
+          - Port: {{ rds_instance.endpoint.port | default('Not available') }}
+          - Status: {{ rds_instance.status | default('Unknown') }}
+          - Username: dbadmin
+          - Password: [SECURE]
+      when: rds_instance is defined and rds_instance.endpoint is defined
+      ignore_errors: yes
+
+    # --- Save resource information to a local file for reference ---
+    - name: Get current date for filename if ansible_date_time is unavailable
+      command: date +%Y-%m-%d
+      register: current_date
+      when: ansible_date_time is not defined
+      ignore_errors: yes
+      
+    - name: Set filename date
+      set_fact:
+        file_date: "{{ ansible_date_time.date | default((current_date.stdout if current_date is defined else 'unknown-date')) }}"
+      ignore_errors: yes
+      
+    - name: Save provisioned resources information to a file
+      copy:
+        content: |
+          AWS Resources Provisioned with Ansible
+          =====================================
+          Date: {{ ansible_date_time.iso8601 | default(lookup('pipe','date -Iseconds')) }}
+          
+          VPC:
+          - ID: {{ my_vpc.vpc.id }}
+          - CIDR: {{ vpc_cidr_block }}
+          
+          Subnet:
+          - ID: {{ my_subnet.subnet.id }}
+          - CIDR: {{ subnet_cidr_block }}
+          - Subnet 2 ID: {{ second_subnet.subnet.id }}
+          - Subnet 2 CIDR: 10.0.2.0/24
+          
+          Internet Gateway:
+          - ID: {{ igw.gateway_id }}
+          
+          Security Groups:
+          - Web/SSH: {{ security_group.group_id }}
+          - RDS: {{ rds_security_group.group_id | default('Not created') }}
+          
+          EC2 Instance:
+          - ID: {{ ec2.instances[0].instance_id }}
+          - Public IP: {{ ec2.instances[0].public_ip_address }}
+          - Private IP: {{ ec2.instances[0].private_ip_address }}
+          
+          S3 Buckets:
+          {% for bucket in bucket_names | default([]) %}
+          - {{ bucket }}
+          {% endfor %}
+          
+          RDS Instance:
+          - Identifier: ansible-mysql-instance
+          - Endpoint: {{ rds_endpoint | default('Not available') }}
+          - Port: {{ rds_port | default('Not available') }}
+          - Username: dbadmin
+          - Password: [STORED SECURELY - Use the generated password displayed during provisioning]
+          
+          Custom AMI:
+          - ID: {{ created_ami.image_id }}
+          - Name: {{ ami_name }}
+        dest: "./aws_resources_{{ file_date }}.txt"
+        mode: '0644'
+      ignore_errors: yes
